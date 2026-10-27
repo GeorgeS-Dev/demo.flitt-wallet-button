@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Flitt one-button wallet demo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 420px; margin: 40px auto; padding: 0 16px; }
+    label { display: block; font-weight: 600; margin-bottom: 6px; }
+    input { font-size: 20px; padding: 8px 10px; width: 100%; box-sizing: border-box; }
+    .payment-button-container { margin: 24px 0; min-height: 48px; transition: opacity .2s; }
+    .payment-button-container.stale { opacity: .35; pointer-events: none; }
+    .switch { display: flex; gap: 8px; margin-bottom: 24px; }
+    .switch button { flex: 1; font-size: 15px; padding: 10px; border: 1px solid #111; border-radius: 8px; background: #fff; cursor: pointer; }
+    .switch button.active { background: #111; color: #fff; }
+    #fallback { display: none; color: #a00; }
+    pre { background: #f4f4f4; padding: 12px; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <div class="switch">
+    <button type="button" data-wallet="apple">Apple Pay</button>
+    <button type="button" data-wallet="google">Google Pay</button>
+  </div>
+  <h2>Deposit</h2>
+  <label for="amount">Amount (GEL)</label>
+  <input id="amount" type="text" inputmode="decimal" value="1.00" autocomplete="off" />
+  <p>Wallet: <strong id="wallet">detecting…</strong></p>
+
+  <div class="payment-button-container"></div>
+  <p id="fallback">No wallet available on this device. Show the card form here instead.</p>
+  <pre id="log"></pre>
+
+  <script src="https://cdn.jsdelivr.net/npm/@flittpayments/js-sdk@2.0.15/dist/umd/checkout.js"></script>
+  <script>
+    const log = (label, data) =>
+      (document.getElementById('log').textContent += label + ' ' + JSON.stringify(data ?? '', null, 2) + '\n');
+    const container = document.querySelector('.payment-button-container');
+    const amountInput = document.getElementById('amount');
+
+    // ONE button: Apple devices (WebKit exposes ApplePaySession natively) get Apple Pay,
+    // everything else gets Google Pay. Decide BEFORE the SDK loads Apple's JS, which would
+    // otherwise make Apple Pay (QR flow) look available in desktop Chrome too.
+    function pickWallet() {
+      const forced = new URLSearchParams(location.search).get('wallet');
+      if (forced === 'apple' || forced === 'google') return forced;
+      try {
+        if (window.ApplePaySession && ApplePaySession.canMakePayments()) return 'apple';
+      } catch (e) { /* not a secure context, or not WebKit */ }
+      return 'google';
+    }
+
+    // "5", "5.5", "5,50" -> 550 tetri. Anything else -> null.
+    function toTetri(text) {
+      const m = text.trim().replace(',', '.').match(/^(\d{1,7})(?:\.(\d{1,2}))?$/);
+      if (!m) return null;
+      const tetri = Number(m[1]) * 100 + Number((m[2] || '').padEnd(2, '0'));
+      return tetri > 0 ? tetri : null;
+    }
+
+    const method = pickWallet();
+    let paymentButton = null;
+
+    // Demo switch: reload with ?wallet=… (one SDK button per page load), keeping the typed amount.
+    const query = new URLSearchParams(location.search);
+    if (query.get('amount')) amountInput.value = query.get('amount');
+    document.querySelectorAll('.switch button').forEach((b) => {
+      b.classList.toggle('active', b.dataset.wallet === method);
+      b.addEventListener('click', () => {
+        query.set('wallet', b.dataset.wallet);
+        query.set('amount', amountInput.value);
+        location.search = query.toString();
+      });
+    });
+    let currentOrder = null;
+
+    // Runs AFTER the payer authorized in the native sheet (Face ID / Google confirm), so the
+    // tap itself opens the sheet with no network round-trip in between - Apple requires the
+    // session to start synchronously inside the tap. Only now do we create our transaction.
+    // Whatever we resolve is merged into the SDK's final charge request.
+    async function createOrderAfterAuthorization(defer, params) {
+      try {
+        const res = await fetch('/api/orders', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ amountTetri: Number(params.amount) }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        currentOrder = await res.json();
+        log('order created after authorization', currentOrder);
+        defer.resolve({ token: currentOrder.token });
+      } catch (err) {
+        log('order failed', String(err));
+        defer.reject(err);
+      }
+    }
+
+    async function init() {
+      document.getElementById('wallet').textContent = method === 'apple' ? 'Apple Pay' : 'Google Pay';
+      log('env', { origin: location.origin, secureContext: window.isSecureContext, wallet: method });
+      if (/^(localhost|127\.0\.0\.1)$/.test(location.hostname))
+        log('WARNING', 'Flitt blocks localhost/127.0.0.1 (403) - open http://wallet.localhost:' + location.port + location.search);
+      if (method === 'apple' && location.protocol !== 'https:')
+        log('WARNING', 'Apple Pay needs HTTPS on a domain registered with Flitt - it will not render here. Try ?wallet=google in Chrome.');
+
+      const config = await (await fetch('/api/config')).json();
+      const fallbackTimer = setTimeout(() => (document.getElementById('fallback').style.display = 'block'), 4000);
+
+      // Client-side mode: merchant_id + amount + currency, no order yet. The button renders on load.
+      paymentButton = $checkout
+        .get('PaymentButton', {
+          element: '.payment-button-container',
+          methods: [method],
+          style: { type: 'long', color: 'black', mode: 'pay', height: 48 },
+          data: { merchant_id: config.merchantId, currency: config.currency, amount: toTetri(amountInput.value), lang: 'en' },
+          // Plain wrapper on purpose: the SDK's isFunction() rejects async functions
+          // ([object AsyncFunction]) and silently falls back to its default hook.
+          after: function (defer, params) { createOrderAfterAuthorization(defer, params); },
+        })
+        .on('shown:' + method, () => { clearTimeout(fallbackTimer); log('button shown', method); })
+        .on('success', async (model) => {
+          log('success (client side, not final)', model);
+          // The final status comes from the server callback; the demo also polls Flitt.
+          const status = await (await fetch(`/api/orders/${currentOrder.orderId}/status`)).json();
+          log('status from Flitt', status);
+        })
+        .on('error', (model) => log('error', model));
+    }
+
+    // Typing only changes the amount the sheet will show - no transaction is created here.
+    let debounce;
+    amountInput.addEventListener('input', () => {
+      clearTimeout(debounce);
+      const tetri = toTetri(amountInput.value);
+      container.classList.add('stale');
+      if (tetri === null || !paymentButton) return;
+      debounce = setTimeout(() => {
+        const refresh = paymentButton.update({ amount: tetri });
+        if (refresh) refresh.always(() => container.classList.remove('stale'));
+        else container.classList.remove('stale');
+      }, 300);
+    });
+
+    init().catch((e) => log('init failed', String(e)));
+  </script>
+</body>
+</html>
