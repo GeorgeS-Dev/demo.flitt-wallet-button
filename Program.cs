@@ -111,6 +111,17 @@ app.MapMethods("/payment-return", new[] { "GET", "POST" }, (HttpRequest req) =>
 app.MapGet("/api/orders/{orderId}", (string orderId) =>
     orders.TryGetValue(orderId, out var order) ? Results.Ok(order) : Results.NotFound());
 
+// Payer closed the wallet before any wallet data reached Flitt. Only an untouched order can be
+// released; the Flitt token is never used and expires with `lifetime`. A late signed callback
+// still overwrites the status, so real money movement is never hidden.
+app.MapPost("/api/orders/{orderId}/cancel", (string orderId) =>
+{
+    if (!orders.TryGetValue(orderId, out var order)) return Results.NotFound();
+    if (order.Status != "created") return Results.Conflict(order);
+    var cancelled = order with { Status = "cancelled" };
+    return orders.TryUpdate(orderId, cancelled, order) ? Results.Ok(cancelled) : Results.Conflict(orders[orderId]);
+});
+
 app.Run();
 
 static async Task<JsonNode?> PostFlitt(IHttpClientFactory http, string path, Dictionary<string, object?> request)

@@ -3,7 +3,7 @@
 
   // One page = one attempt. Reload explicitly for a new attempt, including after an
   // ambiguous network result. Never automatically retry a wallet charge.
-  function createFlow({ createOrder, amount, onState = () => {}, onOrder = () => {} }) {
+  function createFlow({ createOrder, amount, onState = () => {}, onOrder = () => {}, releaseOrder = () => {} }) {
     let attempt = null;
     return {
       before(defer) {
@@ -38,6 +38,7 @@
           onOrder(order);
           onState('processing');
           // This is the only point that permits the SDK to submit wallet data.
+          current.submitted = true;
           defer.resolve({ token: order.token });
         }).catch(error => {
           onState('blocked', error);
@@ -45,7 +46,29 @@
         });
       },
       cancel() { if (attempt) attempt.cancelled = true; },
+      // Ends an attempt that never reached Flitt (sheet closed, wallet error, order failure)
+      // so the payer can tap again, and releases its backend order once it exists.
+      // Returns false once wallet data was submitted: that attempt is settled by payment
+      // status, never by a retry, so a second charge can't happen.
+      reset() {
+        const current = attempt;
+        if (!current) return true;
+        if (current.submitted) return false;
+        current.cancelled = true;
+        attempt = null;
+        current.order.then(({ order }) => { if (order && order.orderId) releaseOrder(order); });
+        return true;
+      },
     };
+  }
+
+  // Apple: { code: 20, message: 'cancel' }. Google: statusCode CANCELED, which the SDK
+  // forwards as { code, message } and may leave both empty.
+  function isCancellation(error) {
+    if (!error) return true;
+    if (error.code === 20 || error.statusCode === 'CANCELED' || error.code === 'CANCELED') return true;
+    if (error.code === undefined && !error.message) return true;
+    return /cancel|closed/i.test(String(error.message || ''));
   }
 
   function challengeRequest(model) {
@@ -103,7 +126,7 @@
     return api;
   }
 
-  const exported = { createFlow, challengeRequest, install3dsHandling };
+  const exported = { createFlow, isCancellation, challengeRequest, install3dsHandling };
   if (typeof module !== 'undefined' && module.exports) module.exports = exported;
   else root.WalletDemo = exported;
 })(globalThis);

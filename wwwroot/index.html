@@ -85,10 +85,33 @@
       document.querySelectorAll('.switch button').forEach(b => b.disabled = true);
       container.classList.add('stale');
     }
+    function unlock() {
+      amountInput.disabled = false;
+      document.querySelectorAll('.switch button').forEach(b => b.disabled = false);
+      container.classList.remove('stale');
+      restart.hidden = true;
+    }
     function failure(error) {
       flow.cancel();
       statusElement.textContent = 'Payment not confirmed. ' + String(error?.message || error);
       restart.hidden = false;
+    }
+    // Wallet sheet closed or failed, or our order couldn't be created. Nothing reached Flitt
+    // yet, so go straight back to the ready state. If the charge WAS submitted, never retry:
+    // show the real status instead.
+    function attemptEnded(error) {
+      if (!flow.reset()) {
+        statusElement.textContent = 'Checking payment…';
+        if (currentOrder) showStatus(currentOrder.orderId).catch(failure);
+        else failure(error);
+        return;
+      }
+      currentOrder = null;
+      unlock();
+      statusElement.textContent = WalletDemo.isCancellation(error)
+        ? 'Payment cancelled. Nothing was charged.'
+        : 'Payment not started: ' + String(error?.message || error) + ' Nothing was charged — try again.';
+      log('attempt reset', { reason: error?.message || 'cancelled' });
     }
     const flow = WalletDemo.createFlow({
       amount: () => toTetri(amountInput.value),
@@ -101,14 +124,19 @@
         return response.json();
       },
       onState: (state, error) => {
+        if (state === 'blocked') { log('blocked', error.message); attemptEnded(error); return; }
         lock();
         statusElement.textContent = ({
           opening: 'Complete the wallet prompt.',
           initializing: 'Preparing your order…',
           processing: 'Processing payment…',
-          blocked: 'Order initialization failed. Payment was not submitted.',
         })[state];
-        if (error) { log('blocked', error.message); restart.hidden = false; }
+      },
+      // The tap already created an order; free it so it never looks like a pending deposit.
+      releaseOrder: order => {
+        fetch('/api/orders/' + encodeURIComponent(order.orderId) + '/cancel', { method: 'POST' })
+          .then(r => log('order released', { orderId: order.orderId, status: r.status }))
+          .catch(e => log('order release failed', String(e)));
       },
       onOrder: order => {
         currentOrder = order;
@@ -181,7 +209,10 @@
             await showStatus(currentOrder.orderId);
           } catch (error) { failure(error); }
         })
-        .on('error', (model) => failure(model.attr ? model.attr('error.message') || 'Wallet/payment error' : model.message || 'Wallet cancelled'));
+        // Fires for a closed/failed wallet sheet ({ code, message }) and for a failed charge (SDK model).
+        .on('error', (model) => attemptEnded(model && model.attr
+          ? { message: model.attr('error.message') || 'Payment error' }
+          : model));
     }
 
     // Typing only changes the amount the sheet will show - no transaction is created here.

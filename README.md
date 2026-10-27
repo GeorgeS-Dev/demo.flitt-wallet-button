@@ -32,8 +32,11 @@ and `Flitt__CallbackUrl` environment variables.
 5. Flitt's signed callback updates our existing order. Neither a browser return
    nor the native wallet success display marks our order paid.
 
-One page permits one attempt. Use "Start a new payment" to reload for another.
-A cancelled wallet can leave an unpaid order. There are no automatic charge retries.
+Closing the wallet sheet, a wallet error, or a failed order initialization happens BEFORE
+anything reaches Flitt: the page returns to ready (amount and button unlocked, tap again) and
+the order the tap created is released via `POST /api/orders/{id}/cancel` (`created` → `cancelled`).
+Once wallet data was submitted, the attempt is never reset or retried — the page shows the
+payment status instead, and "Start a new payment" reloads. There are no automatic charge retries.
 A network error AFTER payment submission is an unknown outcome, not proof of no charge.
 
 Hooks must be plain functions: SDK 2.0.15 ignores directly supplied async functions.
