@@ -6,8 +6,8 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 
 // One-button Apple Pay / Google Pay demo on top of Flitt's JS SDK (PaymentButton).
-// Flow: button renders from merchant_id + amount (no order) -> tap opens the native sheet ->
-// payer authorizes -> SDK's `after` hook calls /api/orders -> SDK submits wallet data + token -> Flitt calls back.
+// Flow: click starts our order + opens the sheet. Our order is inserted before requesting
+// a Flitt token. The SDK after hook blocks payment until both order creation and wallet authorization finish.
 
 var builder = WebApplication.CreateBuilder(args);
 var flitt = builder.Configuration.GetSection("Flitt").Get<FlittOptions>()!;
@@ -23,13 +23,13 @@ var appleAssociation = Path.Combine(app.Environment.ContentRootPath, "apple-deve
 app.MapGet("/.well-known/apple-developer-merchantid-domain-association", () =>
     File.Exists(appleAssociation) ? Results.File(appleAssociation, "text/plain") : Results.NotFound());
 
-// Stand-in for our own transaction table: the order exists BEFORE the wallet sheet opens.
+// Demo-only store. Insert our record before making any Flitt order request.
 var orders = new ConcurrentDictionary<string, OrderRecord>();
 
 // Public merchant id for the button's client-side mode (renders without an order).
 app.MapGet("/api/config", () => Results.Ok(new { merchantId = flitt.MerchantId, currency = "GEL" }));
 
-// 1. Create our transaction + Flitt order. Called AFTER the payer authorizes in the wallet sheet.
+// 1. Called on wallet click, concurrently with opening the native sheet.
 app.MapPost("/api/orders", async (CreateOrder body, HttpRequest req, IHttpClientFactory http) =>
 {
     // Empty CallbackUrl = call back to whatever public host served the page (e.g. the HTTPS tunnel).
@@ -38,7 +38,10 @@ app.MapPost("/api/orders", async (CreateOrder body, HttpRequest req, IHttpClient
         return Results.BadRequest("amountTetri must be between 1 and 100000000");
 
     var callbackUrl = string.IsNullOrEmpty(flitt.CallbackUrl) ? $"{scheme}://{req.Host}/flitt/callback" : flitt.CallbackUrl;
-    var orderId = $"wallet-{DateTime.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid().ToString("N")[..6]}";
+    var orderId = $"wallet-{Guid.NewGuid():N}";
+    if (!orders.TryAdd(orderId, new OrderRecord(orderId, body.AmountTetri, "created")))
+        return Results.Problem("Could not create our order.");
+    var returnUrl = $"{scheme}://{req.Host}/payment-return?orderId={Uri.EscapeDataString(orderId)}";
     var request = new Dictionary<string, object?>
     {
         ["order_id"] = orderId,
@@ -48,16 +51,27 @@ app.MapPost("/api/orders", async (CreateOrder body, HttpRequest req, IHttpClient
         ["currency"] = "GEL",
         ["lifetime"] = 900,
         ["server_callback_url"] = callbackUrl,
+        ["response_url"] = returnUrl,
+        ["delayed"] = "N",
     };
     request["signature"] = FlittSignature.Compute(flitt.SecretKey, request);
 
-    var response = await PostFlitt(http, "/api/checkout/token", request);
-    var token = response?["token"]?.GetValue<string>();
-    if (token is null)
-        return Results.Problem(response?.ToJsonString() ?? "empty response from Flitt");
-
-    orders[orderId] = new OrderRecord(orderId, body.AmountTetri, "created");
-    return Results.Ok(new { orderId, token, merchantId = flitt.MerchantId });
+    try
+    {
+        var response = await PostFlitt(http, "/api/checkout/token", request);
+        var token = response?["token"]?.GetValue<string>();
+        if (response?["response_status"]?.GetValue<string>() != "success" || string.IsNullOrWhiteSpace(token))
+        {
+            orders[orderId] = orders[orderId] with { Status = "initialization_failed" };
+            return Results.Problem("Flitt could not initialize this order. Payment was not submitted.");
+        }
+        return Results.Ok(new { orderId, token, merchantId = flitt.MerchantId });
+    }
+    catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+    {
+        orders[orderId] = orders[orderId] with { Status = "initialization_unknown" };
+        return Results.Problem("Could not obtain a Flitt token. Payment was not submitted.", statusCode: 502);
+    }
 });
 
 // 2. Flitt server callback: the only place a deposit is actually confirmed.
@@ -69,7 +83,12 @@ app.MapPost("/flitt/callback", async (HttpRequest req, ILogger<Program> log) =>
     var status = fields.GetValueOrDefault("order_status")?.ToString() ?? "";
     log.LogInformation("Flitt callback order={OrderId} status={Status} signatureValid={Valid}", orderId, status, valid);
     if (!valid) return Results.BadRequest();
-    orders.AddOrUpdate(orderId, id => new OrderRecord(id, 0, status), (_, o) => o with { Status = status });
+    if (!orders.TryGetValue(orderId, out var order)) return Results.NotFound();
+    if (fields.GetValueOrDefault("merchant_id")?.ToString() != flitt.MerchantId.ToString(CultureInfo.InvariantCulture)
+        || fields.GetValueOrDefault("currency")?.ToString() != "GEL"
+        || fields.GetValueOrDefault("amount")?.ToString() != order.AmountTetri.ToString(CultureInfo.InvariantCulture))
+        return Results.BadRequest();
+    orders[orderId] = order with { Status = status };
     return Results.Ok();
 });
 
@@ -82,12 +101,23 @@ app.MapGet("/api/orders/{orderId}/status", async (string orderId, IHttpClientFac
     return Results.Content(response?.ToJsonString() ?? "{}", "application/json");
 });
 
+// Browser returns are navigation only: never mark an order paid from return parameters.
+app.MapMethods("/payment-return", new[] { "GET", "POST" }, (HttpRequest req) =>
+{
+    var orderId = req.Query["orderId"].ToString();
+    return Results.Redirect($"/?order={Uri.EscapeDataString(orderId)}");
+});
+
+app.MapGet("/api/orders/{orderId}", (string orderId) =>
+    orders.TryGetValue(orderId, out var order) ? Results.Ok(order) : Results.NotFound());
+
 app.Run();
 
 static async Task<JsonNode?> PostFlitt(IHttpClientFactory http, string path, Dictionary<string, object?> request)
 {
     var client = http.CreateClient("flitt");
     using var res = await client.PostAsJsonAsync(path, new { request });
+    res.EnsureSuccessStatusCode();
     var json = await JsonNode.ParseAsync(await res.Content.ReadAsStreamAsync());
     return json?["response"];
 }

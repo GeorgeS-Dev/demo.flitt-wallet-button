@@ -29,7 +29,10 @@
 
   <div class="payment-button-container"></div>
   <p id="fallback">No wallet available on this device. Show the card form here instead.</p>
+  <p id="status" role="status" aria-live="polite"></p>
+  <button id="restart" type="button" hidden>Start a new payment</button>
   <pre id="log"></pre>
+  <script src="/wallet-flow.js"></script>
 
   <script src="https://cdn.jsdelivr.net/npm/@flittpayments/js-sdk@2.0.15/dist/umd/checkout.js"></script>
   <script>
@@ -55,7 +58,7 @@
       const m = text.trim().replace(',', '.').match(/^(\d{1,7})(?:\.(\d{1,2}))?$/);
       if (!m) return null;
       const tetri = Number(m[1]) * 100 + Number((m[2] || '').padEnd(2, '0'));
-      return tetri > 0 ? tetri : null;
+      return tetri > 0 && tetri <= 100000000 ? tetri : null;
     }
 
     const method = pickWallet();
@@ -74,25 +77,62 @@
     });
     let currentOrder = null;
 
-    // Runs AFTER the payer authorized in the native sheet (Face ID / Google confirm), so the
-    // tap itself opens the sheet with no network round-trip in between - Apple requires the
-    // session to start synchronously inside the tap. Only now do we create our transaction.
-    // Whatever we resolve is merged into the SDK's final charge request.
-    async function createOrderAfterAuthorization(defer, params) {
-      try {
-        const res = await fetch('/api/orders', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ amountTetri: Number(params.amount) }),
+    const statusElement = document.getElementById('status');
+    const restart = document.getElementById('restart');
+    restart.addEventListener('click', () => { location.href = '/?wallet=' + method; });
+    function lock() {
+      amountInput.disabled = true;
+      document.querySelectorAll('.switch button').forEach(b => b.disabled = true);
+      container.classList.add('stale');
+    }
+    function failure(error) {
+      flow.cancel();
+      statusElement.textContent = 'Payment not confirmed. ' + String(error?.message || error);
+      restart.hidden = false;
+    }
+    const flow = WalletDemo.createFlow({
+      amount: () => toTetri(amountInput.value),
+      createOrder: async amountTetri => {
+        const response = await fetch('/api/orders', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ amountTetri }),
         });
-        if (!res.ok) throw new Error(await res.text());
-        currentOrder = await res.json();
-        log('order created after authorization', currentOrder);
-        defer.resolve({ token: currentOrder.token });
-      } catch (err) {
-        log('order failed', String(err));
-        defer.reject(err);
-      }
+        if (!response.ok) throw new Error('Backend order initialization failed. Payment submission blocked.');
+        return response.json();
+      },
+      onState: (state, error) => {
+        lock();
+        statusElement.textContent = ({
+          opening: 'Complete the wallet prompt.',
+          initializing: 'Preparing your order…',
+          processing: 'Processing payment…',
+          blocked: 'Order initialization failed. Payment was not submitted.',
+        })[state];
+        if (error) { log('blocked', error.message); restart.hidden = false; }
+      },
+      onOrder: order => {
+        currentOrder = order;
+        // Keep the identifier across a full-page 3DS redirect, never wallet credentials.
+        sessionStorage.setItem('wallet-order', order.orderId);
+        log('order ready', { orderId: order.orderId });
+      },
+    });
+
+    async function showStatus(orderId) {
+      lock();
+      restart.hidden = false;
+      // Minimal demo: display callback state separately from the gateway status lookup.
+      // A redirect or client success event never marks the order as paid.
+      const local = await fetch('/api/orders/' + encodeURIComponent(orderId));
+      const response = await fetch('/api/orders/' + encodeURIComponent(orderId) + '/status');
+      if (!response.ok) throw new Error('Could not check payment. Do not assume it failed.');
+      const gateway = await response.json();
+      const stored = local.ok ? await local.json() : null;
+      log('callback state', stored);
+      log('Flitt status', { order_status: gateway.order_status, response_status: gateway.response_status });
+      statusElement.textContent = stored?.status === 'approved'
+        ? 'Payment confirmed by signed callback.'
+        : 'Gateway status: ' + (gateway.order_status || 'unknown') + '. Callback status: ' + (stored?.status || 'unknown') + '.';
     }
 
     async function init() {
@@ -103,28 +143,45 @@
       if (method === 'apple' && location.protocol !== 'https:')
         log('WARNING', 'Apple Pay needs HTTPS on a domain registered with Flitt - it will not render here. Try ?wallet=google in Chrome.');
 
+      const returnedOrder = query.get('order');
+      if (returnedOrder) {
+        await showStatus(returnedOrder);
+        return;
+      }
       const config = await (await fetch('/api/config')).json();
+      const api = WalletDemo.install3dsHandling($checkout.get('Api'), {
+        onChallenge: () => {
+          lock();
+          statusElement.textContent = 'Redirecting to your bank for 3DS verification…';
+        },
+        onError: failure,
+      });
       const fallbackTimer = setTimeout(() => (document.getElementById('fallback').style.display = 'block'), 4000);
 
       // Client-side mode: merchant_id + amount + currency, no order yet. The button renders on load.
       paymentButton = $checkout
         .get('PaymentButton', {
+          api,
           element: '.payment-button-container',
           methods: [method],
           style: { type: 'long', color: 'black', mode: 'pay', height: 48 },
           data: { merchant_id: config.merchantId, currency: config.currency, amount: toTetri(amountInput.value), lang: 'en' },
           // Plain wrapper on purpose: the SDK's isFunction() rejects async functions
           // ([object AsyncFunction]) and silently falls back to its default hook.
-          after: function (defer, params) { createOrderAfterAuthorization(defer, params); },
+          before: function (defer) { flow.before(defer); },
+          after: function (defer, params) { flow.after(defer, params); },
         })
         .on('shown:' + method, () => { clearTimeout(fallbackTimer); log('button shown', method); })
         .on('success', async (model) => {
-          log('success (client side, not final)', model);
-          // The final status comes from the server callback; the demo also polls Flitt.
-          const status = await (await fetch(`/api/orders/${currentOrder.orderId}/status`)).json();
-          log('status from Flitt', status);
+          try {
+            // Process SDK redirect/form responses as well as 3DS progress notifications.
+            if (model.sendResponse()) return;
+            if (model.submitToMerchant()) return;
+            if (!currentOrder) throw new Error('Missing backend order; payment status unknown.');
+            await showStatus(currentOrder.orderId);
+          } catch (error) { failure(error); }
         })
-        .on('error', (model) => log('error', model));
+        .on('error', (model) => failure(model.attr ? model.attr('error.message') || 'Wallet/payment error' : model.message || 'Wallet cancelled'));
     }
 
     // Typing only changes the amount the sheet will show - no transaction is created here.

@@ -1,58 +1,126 @@
 # Flitt one-button wallet demo
 
-Minimal .NET 8 page that shows **one** wallet button (Apple Pay on Apple devices, Google Pay
-everywhere else) using Flitt's JS SDK `PaymentButton`. A single tap opens the native sheet.
+.NET 8 minimal web API + Flitt PaymentButton SDK 2.0.15. Orders deliberately live
+in memory for testing; no database or production ledger.
 
-```
-dotnet run --project demo.flitt-wallet-button/Demo.csproj --urls http://localhost:5077
-```
+## Run
 
-Open **http://wallet.localhost:5077** — not `localhost`. Flitt's CDN returns 403 for the SDK's
-gateway iframe when `origin` is `localhost` / `127.0.0.1`, and the button never renders.
-`*.localhost` passes and Chrome still treats it as a secure context.
-
-`?wallet=apple` / `?wallet=google` forces a wallet.
-
-## Flow
-
-1. Page load → `$checkout.get('PaymentButton', { methods: [oneMethod], data: { merchant_id, amount, currency }, after })`.
-   Client-side mode: the button renders with **no order**. Typing calls `paymentButton.update({ amount })`.
-2. Tap → native Apple Pay / Google Pay sheet opens immediately (no network call in the tap —
-   Apple requires the session to start synchronously inside the gesture). Apple merchant
-   validation only needs `merchant_id` + domain, not an order.
-3. Payer authorizes → SDK calls our `after(defer, params)` hook → `POST /api/orders` creates our
-   transaction + Flitt token → `defer.resolve({ token })` → SDK merges it into the charge request.
-   **Pass a plain `function`, not an `async function`**: the SDK's `isFunction()` checks
-   `[object Function]`, rejects `AsyncFunction`, and silently uses its default hook — the charge
-   then goes out with no order of ours.
-4. Flitt → `server_callback_url` (signature-verified in `/flitt/callback`). That is the source of truth.
-   The callback URL follows the host the page was opened on, so it works through the tunnel.
-
-## HTTPS tunnel
-
-```
-cloudflared tunnel --no-autoupdate --protocol http2 --url http://localhost:5077
+```sh
+dotnet run --project Demo.csproj --urls http://localhost:5078
+cloudflared tunnel --no-autoupdate --protocol http2 --url http://localhost:5078
 ```
 
-Prints a `https://<random>.trycloudflare.com` URL. `--protocol http2` because QUIC (UDP) is
-blocked on our network and the tunnel never connects without it (Error 1033).
-`CallbackUrl` is empty in `appsettings.json`, so the callback URL follows the host the page was
-opened on — Flitt's server callback reaches `/flitt/callback` through the tunnel.
+Open the HTTPS tunnel with `?wallet=google` or `?wallet=apple`.
+For local Google Pay UI testing, the original demo observed that
+`http://wallet.localhost:5078` works where bare localhost received an iframe 403.
+That is a test observation, not an exemption from domain registration.
 
-The quick-tunnel hostname **changes on every restart**, so it is fine for Google Pay and callbacks
-but a poor host to register with Apple. For Apple Pay registration use a stable hostname:
-a Cloudflare named tunnel on a domain we own (`cloudflared tunnel login` → `tunnel create` →
-`tunnel route dns`), an ngrok reserved domain, or a real staging host.
+The configured MID 1549901 / secret "test" are Flitt's public test credentials.
+Never commit live secrets; override via `Flitt__MerchantId`, `Flitt__SecretKey`
+and `Flitt__CallbackUrl` environment variables.
 
-## Apple Pay — why it doesn't work locally
+## Order gate: both wallets
 
-Apple Pay JS refuses to start on anything but HTTPS on a domain registered for the merchant ID.
-Flitt's test merchant uses Flitt's own Apple merchant ID `merchant.flitt`, so to test:
+1. Typing updates the amount; it does not create an order.
+2. Click starts `POST /api/orders` in `before`. The hook resolves synchronously
+   so the native wallet opens within the click gesture.
+3. Backend inserts our in-memory order FIRST, then requests Flitt's checkout
+   token using that ID, amount, GEL, lifetime=900, delayed=N, callback and return URLs.
+4. After wallet authorization, `after` waits for that same backend request.
+   Only a valid order ID + token releases the final SDK payment submission.
+   Failure, missing token, cancellation, or an amount mismatch rejects the hook.
+5. Flitt's signed callback updates our existing order. Neither a browser return
+   nor the native wallet success display marks our order paid.
 
-1. Expose the demo on a public HTTPS host (staging domain or a tunnel).
-2. Ask Flitt support for `apple-developer-merchantid-domain-association.txt`, put it in this
-   folder — it is served at `/.well-known/apple-developer-merchantid-domain-association`.
-3. Ask Flitt to activate that domain with Apple.
-4. Open in Safari on an iPhone/Mac with a real card in Wallet (test mode converts it to a test token).
+One page permits one attempt. Use "Start a new payment" to reload for another.
+A cancelled wallet can leave an unpaid order. There are no automatic charge retries.
+A network error AFTER payment submission is an unknown outcome, not proof of no charge.
 
-Test merchant: `1549901`, secret `test` (Flitt's public sandbox data, `appsettings.json`).
+Hooks must be plain functions: SDK 2.0.15 ignores directly supplied async functions.
+The plain wrappers delegate to asynchronous work.
+
+## Google Pay 3DS
+
+Per Flitt's notice, gambling merchants in Georgia may use this integration on
+the web, not inside Android apps. Do not embed the demo as an Android-app payment flow.
+
+Device-tokenized cards can complete without a challenge; Google-account-only cards
+require 3DS under the supplied notice. Follow the gateway response rather than
+guessing card type or forcing 3DS on all cards.
+
+SDK 2.0.15 emits `submit3ds` as API deferred progress, which PaymentButton does
+not forward. Our dedicated API adapter handles that notification and navigates
+the whole page to the HTTPS challenge, preserving Flitt's URL, method, challenge
+fields and TermUrl. Do not use `prepare3dsData()` for this flow: it rewrites
+TermUrl for an iframe. Normal SDK redirect/form responses are handled too.
+
+The configured browser return is `/payment-return?orderId=...` (GET or POST).
+It ignores payment-result parameters and redirects to the demo's status page.
+The page displays callback state and performs one gateway status lookup.
+This is not a background reconciliation service.
+
+This adapter depends on the inspected pinned SDK response shape. Recheck on upgrade.
+A live non-tokenized-card challenge and return still need verification with a
+Flitt-enabled MID/domain; mocked tests do not establish live payment acceptance.
+
+Apple caveat: this SDK calls completePayment(STATUS_SUCCESS) BEFORE the after hook.
+The sheet may show success before our backend finishes. Ask Flitt for the supported
+approach/version that reports the actual outcome; use the page's confirmed result.
+
+## Domain and merchant setup
+
+Send Flitt every Google Pay hostname mapped to its MID, including relevant staging,
+production and subdomains. Wait for their explicit configuration/activation confirmation.
+
+For Apple Pay, obtain the association file from Flitt and put it at the project root as
+`apple-developer-merchantid-domain-association.txt`. The app serves it at
+`/.well-known/apple-developer-merchantid-domain-association`. Ask Flitt to register
+the HTTPS domain. The file is not included here.
+
+Quick Cloudflare tunnels change hostname on restart. They are temporary test links
+only where Flitt permits that origin, not automatically registered wallet domains.
+Use a stable named tunnel or staging hostname for registered wallet testing.
+
+Callback and return URLs use the public request host and forwarded HTTPS scheme
+in this demo. The tunnel must preserve those headers. Keep it running for callbacks.
+
+## Ask Flitt about ongoing ownership and renewals
+
+- Do you own/renew Apple's merchant identity and payment-processing certificates?
+  Do we need our own Apple Developer account, annual membership, Merchant ID or
+  certificates? Give the exact expiry schedule and renewal owner for each item.
+- Does the Apple domain verification/association file expire or require replacement?
+  What must be repeated after changing DNS, CDN, hosting or HTTPS certificates?
+- Do you manage Google merchant registration/production approval, or do we need
+  a Google Pay & Wallet Console account and merchant ID? Any periodic reapproval?
+- Confirm all staging/live hostname-to-MID mappings, subdomain rules and whether
+  temporary tunnel domains are allowed.
+- Any recurring fees, SDK upgrade requirements or configuration maintenance?
+  Who receives expiry/change notices?
+- Confirm the SDK 3DS progress payload and top-level return flow; provide a
+  Google-account-only card test case requiring a challenge.
+- Can the MID require backend-created tokens? Confirm that rejecting after cannot
+  fall back to an unsigned client-created order.
+- Which supported SDK version fixes Apple native success appearing before payment?
+
+Do not assume everything renews annually: Flitt must confirm ownership and schedules.
+We maintain our domain, DNS, HTTPS, hosting/tunnel and association-file endpoint.
+
+## Verification
+
+```sh
+dotnet build --ignore-failed-sources
+node --test tests/wallet-flow.test.cjs
+```
+
+Tests cover the order gate, failure/cancellation/amount races, overlapping clicks,
+and 3DS progress/form handling. They do not charge real cards.
+
+References:
+- https://docs.flitt.com/api/googlepay-web/
+- https://docs.flitt.com/sdk-and-mobile/sdk/wallets/
+- https://docs.flitt.com/api/callbacks/
+- https://cdn.jsdelivr.net/npm/@flittpayments/js-sdk@2.0.15/dist/umd/checkout.js
+
+The email URL ending in /googlepay-web/3 was inaccessible; the canonical
+/googlepay-web/ page and actual pinned SDK were inspected.
