@@ -28,6 +28,27 @@ gateway iframe when `origin` is `localhost` / `127.0.0.1`, and the button never 
 4. Flitt → `server_callback_url` (signature-verified in `/flitt/callback`). That is the source of truth.
    The callback URL follows the host the page was opened on, so it works through the tunnel.
 
+## Guarantee: no successful backend order → no wallet payment submission
+
+- **Backend** (`POST /api/orders`): records the order (`initializing`) *before* calling Flitt.
+  It is `created` only when Flitt answers `response_status: success` with a non-empty token;
+  otherwise it is `failed` and the response is an error with no token.
+- **After hook**: resolves only for a 2xx response carrying a non-empty `orderId` and `token`,
+  and remembers that token with the order's amount. Anything else rejects.
+- **Submission gate**: the SDK submits wallet data in exactly one place,
+  `api.request('api.checkout.form', …)`. The page wraps that `Api` and refuses the call unless its
+  token was issued by our backend for that exact amount (one use per token). This holds even if the
+  after hook is bypassed or replaced by the SDK default.
+- **Fail closed**: if the SDK did not take the gated `Api` or our hook, the button is removed.
+- **Callback**: a signed callback for an order we never created is logged as `ORPHAN` and not adopted.
+
+Checked in the browser by driving the SDK's real post-authorization path with Flitt submission
+recorded instead of sent: backend 502, backend 200 without token, hook bypassed, forged token and
+tampered amount each produced 0 submissions; the real backend order produced exactly 1.
+
+Scope: this is enforced in the page. A client that ignores our page can still call Flitt in
+client-side mode with just `merchant_id` — only Flitt can forbid token-less charges (ask them).
+
 ## HTTPS tunnel
 
 ```

@@ -39,6 +39,11 @@ app.MapPost("/api/orders", async (CreateOrder body, HttpRequest req, IHttpClient
 
     var callbackUrl = string.IsNullOrEmpty(flitt.CallbackUrl) ? $"{scheme}://{req.Host}/flitt/callback" : flitt.CallbackUrl;
     var orderId = $"wallet-{DateTime.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid().ToString("N")[..6]}";
+
+    // Our record exists before Flitt hears of the order, so no Flitt token can outlive a missing record.
+    if (!orders.TryAdd(orderId, new OrderRecord(orderId, body.AmountTetri, "initializing")))
+        return Results.Problem("Could not record the order. Payment must not be submitted.", statusCode: 500);
+
     var request = new Dictionary<string, object?>
     {
         ["order_id"] = orderId,
@@ -51,12 +56,27 @@ app.MapPost("/api/orders", async (CreateOrder body, HttpRequest req, IHttpClient
     };
     request["signature"] = FlittSignature.Compute(flitt.SecretKey, request);
 
-    var response = await PostFlitt(http, "/api/checkout/token", request);
-    var token = response?["token"]?.GetValue<string>();
-    if (token is null)
-        return Results.Problem(response?.ToJsonString() ?? "empty response from Flitt");
+    // Success = Flitt says "success" AND returns a token. Anything else is a failed order, and the
+    // frontend only ever receives a token from this success branch.
+    string? token = null;
+    try
+    {
+        var response = await PostFlitt(http, "/api/checkout/token", request);
+        if (response?["response_status"]?.GetValue<string>() == "success")
+            token = response["token"]?.GetValue<string>();
+    }
+    catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException or InvalidOperationException)
+    {
+        // Fall through to the failure branch below.
+    }
 
-    orders[orderId] = new OrderRecord(orderId, body.AmountTetri, "created");
+    if (string.IsNullOrWhiteSpace(token))
+    {
+        orders[orderId] = orders[orderId] with { Status = "failed" };
+        return Results.Problem("Flitt did not create the order. Payment must not be submitted.", statusCode: 502);
+    }
+
+    orders[orderId] = orders[orderId] with { Status = "created" };
     return Results.Ok(new { orderId, token, merchantId = flitt.MerchantId });
 });
 
@@ -69,9 +89,19 @@ app.MapPost("/flitt/callback", async (HttpRequest req, ILogger<Program> log) =>
     var status = fields.GetValueOrDefault("order_status")?.ToString() ?? "";
     log.LogInformation("Flitt callback order={OrderId} status={Status} signatureValid={Valid}", orderId, status, valid);
     if (!valid) return Results.BadRequest();
-    orders.AddOrUpdate(orderId, id => new OrderRecord(id, 0, status), (_, o) => o with { Status = status });
+    if (!orders.TryGetValue(orderId, out var order))
+    {
+        // A payment we never created an order for: the gate was bypassed (or another client used
+        // this merchant). Never adopt it as one of our deposits; surface it loudly instead.
+        log.LogWarning("ORPHAN Flitt callback for unknown order={OrderId} status={Status}", orderId, status);
+        return Results.Ok();
+    }
+    orders[orderId] = order with { Status = status };
     return Results.Ok();
 });
+
+app.MapGet("/api/orders/{orderId}", (string orderId) =>
+    orders.TryGetValue(orderId, out var order) ? Results.Ok(order) : Results.NotFound());
 
 // 3. Status pull, because the demo callback URL is not reachable from Flitt when run locally.
 app.MapGet("/api/orders/{orderId}/status", async (string orderId, IHttpClientFactory http) =>

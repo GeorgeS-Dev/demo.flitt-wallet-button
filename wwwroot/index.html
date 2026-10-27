@@ -80,19 +80,59 @@
     // Whatever we resolve is merged into the SDK's final charge request.
     async function createOrderAfterAuthorization(defer, params) {
       try {
+        const amountTetri = Number(params.amount);
         const res = await fetch('/api/orders', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ amountTetri: Number(params.amount) }),
+          body: JSON.stringify({ amountTetri }),
         });
-        if (!res.ok) throw new Error(await res.text());
-        currentOrder = await res.json();
-        log('order created after authorization', currentOrder);
-        defer.resolve({ token: currentOrder.token });
+        if (!res.ok) throw new Error('backend refused order (' + res.status + ')');
+        const order = await res.json();
+        if (typeof order.orderId !== 'string' || !order.orderId
+            || typeof order.token !== 'string' || !order.token.trim())
+          throw new Error('backend response has no order id / token');
+        backendOrders.set(order.token, { orderId: order.orderId, amountTetri });
+        currentOrder = order;
+        log('order created after authorization', order);
+        defer.resolve({ token: order.token });
       } catch (err) {
-        log('order failed', String(err));
+        log('order failed - wallet payment NOT submitted', String(err.message || err));
         defer.reject(err);
       }
+    }
+    // Plain function on purpose: the SDK's isFunction() rejects async functions
+    // ([object AsyncFunction]) and silently falls back to its default hook.
+    function afterHook(defer, params) { createOrderAfterAuthorization(defer, params); }
+
+    // HARD GATE. The SDK submits wallet data in exactly one place: api.request('api.checkout.form').
+    // Refuse it unless it carries a token our backend issued (after recording the order) for this
+    // exact amount. Holds even if the after hook is bypassed, replaced or misbehaves.
+    const backendOrders = new Map(); // token -> { orderId, amountTetri }, filled ONLY from a successful /api/orders
+    function gateSubmissions(api) {
+      const send = api.request.bind(api);
+      api.request = function (action, method, params) {
+        if (action === 'api.checkout.form') {
+          const issued = params && backendOrders.get(params.token);
+          if (!issued || Number(params.amount) !== issued.amountTetri) {
+            log('BLOCKED wallet submission - no successful backend order', { hasToken: !!(params && params.token) });
+            return refused('No backend order: wallet payment was not submitted.');
+          }
+          backendOrders.delete(params.token); // one submission per backend order
+          log('submission allowed', { orderId: issued.orderId });
+        }
+        return send(action, method, params);
+      };
+      return api;
+    }
+    // Stand-in for the SDK's Deferred, already failed, so PaymentButton reports an error and stops.
+    function refused(message) {
+      const model = { message, attr: (key) => (key === 'error.message' ? message : key === 'error' ? { message } : undefined) };
+      const chain = {
+        done() { return chain; }, progress() { return chain; },
+        fail(cb) { setTimeout(() => cb.call(chain, model)); return chain; },
+        always(cb) { setTimeout(() => cb.call(chain, model)); return chain; },
+      };
+      return chain;
     }
 
     async function init() {
@@ -107,15 +147,15 @@
       const fallbackTimer = setTimeout(() => (document.getElementById('fallback').style.display = 'block'), 4000);
 
       // Client-side mode: merchant_id + amount + currency, no order yet. The button renders on load.
+      const api = gateSubmissions($checkout.get('Api'));
       paymentButton = $checkout
         .get('PaymentButton', {
+          api,
           element: '.payment-button-container',
           methods: [method],
           style: { type: 'long', color: 'black', mode: 'pay', height: 48 },
           data: { merchant_id: config.merchantId, currency: config.currency, amount: toTetri(amountInput.value), lang: 'en' },
-          // Plain wrapper on purpose: the SDK's isFunction() rejects async functions
-          // ([object AsyncFunction]) and silently falls back to its default hook.
-          after: function (defer, params) { createOrderAfterAuthorization(defer, params); },
+          after: afterHook,
         })
         .on('shown:' + method, () => { clearTimeout(fallbackTimer); log('button shown', method); })
         .on('success', async (model) => {
@@ -124,7 +164,14 @@
           const status = await (await fetch(`/api/orders/${currentOrder.orderId}/status`)).json();
           log('status from Flitt', status);
         })
-        .on('error', (model) => log('error', model));
+        .on('error', (model) => log('error', model && model.message ? model.message : model));
+
+      // Fail closed: if the SDK didn't take our gated Api or our hook, show no button at all.
+      if (paymentButton.api !== api || paymentButton.request.api !== api || paymentButton.request.params.after !== afterHook) {
+        container.innerHTML = '';
+        paymentButton = null;
+        log('DISABLED', 'payment gate not installed - wallet button removed');
+      }
     }
 
     // Typing only changes the amount the sheet will show - no transaction is created here.
